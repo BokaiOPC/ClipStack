@@ -17,6 +17,7 @@ import ctypes
 import io
 import os
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -182,6 +183,14 @@ else:
 SOUND_ON = os.path.join(SOUND_DIR, "复制开.wav")
 SOUND_OFF = os.path.join(SOUND_DIR, "复制关.wav")
 
+# 开机自启（HKCU\...\Run，无需管理员权限）
+RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE_NAME = "ClipStack"
+CREATE_NO_WINDOW = 0x08000000
+CFG_FILE = os.path.join(
+    SOUND_DIR,
+    "clipstack_exe.cfg" if getattr(sys, "frozen", False) else "clipstack_py.cfg")
+
 CF_UNICODETEXT, CF_DIB, CF_HDROP = 13, 8, 15
 GMEM_MOVEABLE = 0x0002
 
@@ -191,6 +200,7 @@ ID_DEL0 = 3000     # 条目删除
 ID_CLEAR = 5000
 ID_CLOSE = 5001
 ID_QUIT = 5002
+ID_AUTOSTART = 5003  # 开机自启开关
 
 WIN_W = 430
 ROW_H = 40
@@ -332,6 +342,43 @@ def send_ctrl_v():
     user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
 
 
+# ---------- 开机自启（注册表 Run 键） ----------
+
+def _launch_command():
+    if getattr(sys, "frozen", False):
+        return '"%s"' % sys.executable
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pythonw):
+        pythonw = sys.executable
+    return '"%s" "%s"' % (pythonw, os.path.abspath(__file__))
+
+
+def autostart_enabled():
+    """查询开机自启状态。True/False；查询失败返回 None。"""
+    try:
+        r = subprocess.run(
+            ["reg", "query", RUN_KEY, "/v", RUN_VALUE_NAME],
+            capture_output=True, creationflags=CREATE_NO_WINDOW)
+        return r.returncode == 0
+    except Exception:
+        return None
+
+
+def set_autostart(enable):
+    try:
+        if enable:
+            subprocess.run(
+                ["reg", "add", RUN_KEY, "/v", RUN_VALUE_NAME,
+                 "/t", "REG_SZ", "/d", _launch_command(), "/f"],
+                capture_output=True, creationflags=CREATE_NO_WINDOW)
+        else:
+            subprocess.run(
+                ["reg", "delete", RUN_KEY, "/v", RUN_VALUE_NAME, "/f"],
+                capture_output=True, creationflags=CREATE_NO_WINDOW)
+    except Exception:
+        pass
+
+
 # ---------- 后台监控线程 ----------
 
 
@@ -471,6 +518,17 @@ class ClipStackApp:
 
         threading.Thread(target=clipboard_monitor, args=(self,), daemon=True).start()
         threading.Thread(target=keyboard_hook_thread, args=(self,), daemon=True).start()
+
+        # 首次运行：自动注册开机自启（之后由弹窗按钮手动控制，不会反复强开）
+        if not os.path.exists(CFG_FILE):
+            if autostart_enabled() is not True:
+                set_autostart(True)
+            try:
+                with open(CFG_FILE, "w", encoding="utf-8") as f:
+                    f.write("autostart_init=1\n")
+            except Exception:
+                pass
+
         print("[ClipStack] 已启动：Ctrl+V（多条=弹窗选粘贴，单条=直接粘贴，"
               "双击Ctrl=功能总开关），Enter=粘最新，1-9=选第N条，Esc=取消。", flush=True)
 
@@ -602,6 +660,9 @@ class ClipStackApp:
             y += ROW_H + ROW_GAP
         fy = H - 34
         self._ctrl("BUTTON", "全部清除", 0, 8, fy, 92, 26, ID_CLEAR)
+        auto_state = autostart_enabled()
+        auto_label = "开机自启:开" if auto_state else "开机自启:关"
+        self._ctrl("BUTTON", auto_label, 0, 108, fy, 110, 26, ID_AUTOSTART)
         self._ctrl("BUTTON", "关闭", 0, WIN_W - 148, fy, 60, 26, ID_CLOSE)
         self._ctrl("BUTTON", "退出", 0, WIN_W - 80, fy, 60, 26, ID_QUIT)
 
@@ -656,6 +717,11 @@ class ClipStackApp:
             with self.lock:
                 self.history.clear()
             self.rebuild()
+        elif cid == ID_AUTOSTART:
+            cur = autostart_enabled()
+            set_autostart(not cur)
+            self.rebuild()
+            user32.SetFocus(self.hwnd)
         elif cid == ID_CLOSE:
             self.hide()
         elif cid == ID_QUIT:

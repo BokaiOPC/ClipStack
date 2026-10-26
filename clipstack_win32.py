@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from ctypes import wintypes
 
 from PIL import Image
@@ -126,6 +127,7 @@ WM_CLOSE = 0x10
 WM_ACTIVATE = 0x06
 WM_HOTKEY = 0x312
 WM_APP_REFRESH = 0x8000  # WM_APP
+WM_APP_REBUILD = 0x8003  # 延迟重建界面（避免在自己的消息处理中销毁自己）
 
 SW_HIDE = 0
 SW_SHOW = 5
@@ -224,6 +226,23 @@ CREATE_NO_WINDOW = 0x08000000
 CFG_FILE = os.path.join(
     SOUND_DIR,
     "clipstack_exe.cfg" if getattr(sys, "frozen", False) else "clipstack_py.cfg")
+LOG_FILE = os.path.join(SOUND_DIR, "clipstack.log")
+MAX_DIB_BYTES = 64 * 1024 * 1024  # 单张图片 DIB 上限，超过则跳过（防内存爆掉）
+
+
+def log(msg):
+    """写日志到 clipstack.log（超过 1MB 自动截断），失败静默。"""
+    try:
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 1024 * 1024:
+            with open(LOG_FILE, "r+", encoding="utf-8", errors="ignore") as f:
+                tail = f.readlines()[-2000:]
+                f.seek(0)
+                f.truncate()
+                f.writelines(tail)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
 
 CF_UNICODETEXT, CF_DIB, CF_HDROP = 13, 8, 15
 GMEM_MOVEABLE = 0x0002
@@ -252,10 +271,12 @@ COL_HOVER = 0x00F5EFE0
 
 class _ClipGuard:
     def __enter__(self):
-        for _ in range(20):
+        # 微信等程序复制大文件时可能长时间占用剪贴板，最多等 ~1.8 秒
+        for _ in range(60):
             if user32.OpenClipboard(None):
                 return True
-            time.sleep(0.02)
+            time.sleep(0.03)
+        log("打开剪贴板失败（被其他程序长时间占用）")
         return False
 
     def __exit__(self, *a):
@@ -281,10 +302,23 @@ def _read_image():
     if not h:
         return None
     size = kernel32.GlobalSize(h)
+    if not size or size > MAX_DIB_BYTES:
+        log("跳过超大/异常图片 DIB: %s 字节" % size)
+        return None
     ptr = kernel32.GlobalLock(h)
     if not ptr:
         return None
     try:
+        # 先读 40 字节头做合法性校验，避免异常 DIB 导致超大内存分配
+        header = ctypes.string_at(ptr, 40)
+        bi_w, bi_h = struct.unpack_from("<ii", header, 4)
+        bit_count = struct.unpack_from("<H", header, 14)[0]
+        if not (0 < abs(bi_w) <= 20000 and 0 < abs(bi_h) <= 20000):
+            log("非法图片尺寸 %dx%d，已跳过" % (bi_w, bi_h))
+            return None
+        if bit_count not in (1, 4, 8, 16, 24, 32):
+            log("不支持的位深 %d，已跳过" % bit_count)
+            return None
         dib = ctypes.string_at(ptr, size)
     finally:
         kernel32.GlobalUnlock(h)
@@ -295,7 +329,8 @@ def _read_image():
         img = Image.open(io.BytesIO(bmp))
         img.load()
         return img
-    except Exception:
+    except Exception as e:
+        log("图片解析失败(%dx%d, %s 字节): %s" % (bi_w, bi_h, size, e))
         return None
 
 
@@ -304,11 +339,14 @@ def _read_files():
     if not h:
         return None
     count = shell32.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
+    if count > 500:  # 防止极端数量拖慢
+        count = 500
     paths = []
     for i in range(count):
-        buf = ctypes.create_unicode_buffer(1024)
-        shell32.DragQueryFileW(h, i, buf, 1024)
-        paths.append(buf.value)
+        buf = ctypes.create_unicode_buffer(4096)
+        shell32.DragQueryFileW(h, i, buf, 4096)
+        if buf.value:
+            paths.append(buf.value)
     return paths or None
 
 
@@ -367,6 +405,35 @@ def set_clipboard(item):
         fmt = {"text": CF_UNICODETEXT, "image": CF_DIB, "files": CF_HDROP}[t]
         user32.SetClipboardData(fmt, h)
     return True
+
+
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".ico",
+            ".tif", ".tiff", ".jfif")
+
+
+def first_image_file(paths):
+    """从文件列表里找出第一个可用的图片文件路径（用于生成缩略图）。"""
+    for p in paths[:8]:
+        try:
+            if p.lower().endswith(IMG_EXTS) and os.path.isfile(p) \
+                    and os.path.getsize(p) <= 50 * 1024 * 1024:
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def load_thumb(path, max_w, max_h):
+    """从图片文件加载并缩放为缩略图，失败返回 None。"""
+    try:
+        img = Image.open(path)
+        img.load()
+        img = img.convert("RGBA") if img.mode in ("P", "LA", "PA") else img
+        img.thumbnail((max_w, max_h))
+        return img
+    except Exception as e:
+        log("读取图片文件失败 %s: %s" % (path, e))
+        return None
 
 
 def pil_to_hbitmap(img):
@@ -474,9 +541,15 @@ def clipboard_monitor(app):
                 app.history.append(item)
                 if len(app.history) > MAX_ITEMS:
                     app.history.pop(0)
+            if item["type"] == "image":
+                log("捕获图片 %dx%d" % item["data"].size)
+            elif item["type"] == "files":
+                log("捕获文件 %d 个" % len(item["data"]))
+            else:
+                log("捕获文字 %d 字" % len(item["data"]))
             user32.PostMessageW(app.hwnd, WM_APP_REFRESH, 0, 0)
-        except Exception as e:
-            print("[monitor]", e, flush=True)
+        except Exception:
+            log("监控线程异常:\n" + traceback.format_exc())
 
 
 def keyboard_hook_thread(app):
@@ -524,6 +597,7 @@ class ClipStackApp:
         self._hook_proc = None
         self.feature_on = True  # 双击 Ctrl 控制的总开关
         self._hbitmaps = []     # 缩略图位图句柄，重建时释放
+        self._autostart_state = False  # 启动时查询一次，避免每次重建都调 reg
 
     # ---- 双击 Ctrl 判定（钩子线程调用） ----
     def on_key_event(self, wp, vk):
@@ -595,6 +669,8 @@ class ClipStackApp:
                     f.write("autostart_init=1\n")
             except Exception:
                 pass
+        self._autostart_state = bool(autostart_enabled())
+        log("启动完成，开机自启=%s" % self._autostart_state)
 
         print("[ClipStack] 已启动：Ctrl+V（多条=弹窗选粘贴，单条=直接粘贴，"
               "双击Ctrl=功能总开关），Enter=粘最新，1-9=选第N条，Esc=取消。", flush=True)
@@ -607,6 +683,14 @@ class ClipStackApp:
         user32.UnregisterHotKey(self.hwnd, HOTKEY_ID_CSV)
 
     def _wnd_proc(self, hwnd, msg, wp, lp):
+        """窗口过程包装：任何异常都写日志，不让窗口过程崩掉。"""
+        try:
+            return self._wnd_proc_impl(hwnd, msg, wp, lp)
+        except Exception:
+            log("窗口过程异常 msg=0x%X:\n%s" % (msg, traceback.format_exc()))
+            return user32.DefWindowProcW(hwnd, msg, wp, lp)
+
+    def _wnd_proc_impl(self, hwnd, msg, wp, lp):
         if msg == WM_HOTKEY and wp in (HOTKEY_ID, HOTKEY_ID_CSV):
             if wp == HOTKEY_ID and not user32.IsWindowVisible(self.hwnd):
                 with self.lock:
@@ -629,6 +713,10 @@ class ClipStackApp:
                 self.show_popup()  # 开启时弹一次窗作为反馈
             else:
                 self.hide()        # 关闭后 Ctrl+V 始终为普通粘贴
+            return 0
+        if msg == WM_APP_REBUILD:
+            if user32.IsWindowVisible(self.hwnd):
+                self.rebuild()
             return 0
         if msg == WM_APP_REFRESH:
             if user32.IsWindowVisible(self.hwnd):
@@ -662,6 +750,7 @@ class ClipStackApp:
             self.hide()
             return 0
         if msg == WM_DESTROY:
+            log("窗口销毁，程序退出")
             user32.PostQuitMessage(0)
             return 0
         return user32.DefWindowProcW(hwnd, msg, wp, lp)
@@ -699,7 +788,8 @@ class ClipStackApp:
         files = item["data"]
         names = ", ".join(p.replace("/", "\\").split("\\")[-1] for p in files[:2])
         more = " 等%d个" % len(files) if len(files) > 2 else ""
-        return "  [文件] %d 个%s: %s" % (len(files), more, names[:44])
+        prefix = "[图片文件]" if first_image_file(files) else "[文件]"
+        return "  %s %d 个%s: %s" % (prefix, len(files), more, names[:44])
 
     def rebuild(self):
         items, total = self.visible_items()
@@ -729,6 +819,13 @@ class ClipStackApp:
                 thumb = item["data"].copy()
                 thumb.thumbnail((56, ROW_H - 6))
                 hbmp = pil_to_hbitmap(thumb)
+            elif item["type"] == "files":
+                # 文件列表里含图片文件时，用第一张图做缩略图
+                fp = first_image_file(item["data"])
+                if fp:
+                    thumb = load_thumb(fp, 56, ROW_H - 6)
+                    if thumb is not None:
+                        hbmp = pil_to_hbitmap(thumb)
             if hbmp:
                 self._hbitmaps.append(hbmp)
                 st = self._ctrl("STATIC", "", SS_BITMAP | SS_CENTERIMAGE | SS_NOTIFY,
@@ -745,8 +842,7 @@ class ClipStackApp:
             y += ROW_H + ROW_GAP
         fy = H - 34
         self._ctrl("BUTTON", "全部清除", 0, 8, fy, 92, 26, ID_CLEAR)
-        auto_state = autostart_enabled()
-        auto_label = "开机自启:开" if auto_state else "开机自启:关"
+        auto_label = "开机自启:开" if self._autostart_state else "开机自启:关"
         self._ctrl("BUTTON", auto_label, 0, 108, fy, 110, 26, ID_AUTOSTART)
         self._ctrl("BUTTON", "关闭", 0, WIN_W - 148, fy, 60, 26, ID_CLOSE)
         self._ctrl("BUTTON", "退出", 0, WIN_W - 80, fy, 60, 26, ID_QUIT)
@@ -791,6 +887,10 @@ class ClipStackApp:
         user32.ShowWindow(self.hwnd, SW_HIDE)
 
     # ---- 交互 ----
+    def _defer_rebuild(self):
+        """延迟重建：避免在按钮自己的 WM_COMMAND 处理中销毁该按钮。"""
+        user32.PostMessageW(self.hwnd, WM_APP_REBUILD, 0, 0)
+
     def on_command(self, cid):
         with self.lock:
             n = len(self.history)
@@ -803,11 +903,12 @@ class ClipStackApp:
         elif cid == ID_CLEAR:
             with self.lock:
                 self.history.clear()
-            self.rebuild()
+            self._defer_rebuild()
         elif cid == ID_AUTOSTART:
             cur = autostart_enabled()
             set_autostart(not cur)
-            self.rebuild()
+            self._autostart_state = not cur
+            self._defer_rebuild()
             user32.SetFocus(self.hwnd)
         elif cid == ID_CLOSE:
             self.hide()
@@ -846,10 +947,32 @@ class ClipStackApp:
         with self.lock:
             if 0 <= gi < len(self.history):
                 self.history.pop(gi)
-        self.rebuild()
+        self._defer_rebuild()
         user32.SetFocus(self.hwnd)
 
 
 if __name__ == "__main__":
+    # 崩溃可追溯：faulthandler 捕获段错误，excepthook 捕获未处理异常
+    import faulthandler
+
+    try:
+        _crash_fp = open(LOG_FILE, "a", encoding="utf-8")
+        faulthandler.enable(_crash_fp, all_threads=True)
+    except Exception:
+        pass
+
+    def _excepthook(t, v, tb):
+        log("未捕获异常:\n" + "".join(traceback.format_exception(t, v, tb)))
+
+    def _thread_excepthook(args):
+        log("线程崩溃 [%s]:\n%s" % (
+            getattr(args.thread, "name", "?"),
+            "".join(traceback.format_exception(args.exc_type, args.exc_value,
+                                               args.exc_traceback))))
+
+    sys.excepthook = _excepthook
+    threading.excepthook = _thread_excepthook
+    log("=" * 40 + " ClipStack 启动" + "=" * 40)
     app = ClipStackApp()
     app.run()
+    log("主循环结束，进程退出")

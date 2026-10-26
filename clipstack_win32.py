@@ -79,6 +79,29 @@ class WNDCLASSW(ctypes.Structure):
         ("lpszClassName", LPCWSTR),
     ]
 
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", DWORD),
+        ("biWidth", ctypes.c_long),
+        ("biHeight", ctypes.c_long),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", DWORD),
+        ("biSizeImage", DWORD),
+        ("biXPelsPerMeter", ctypes.c_long),
+        ("biYPelsPerMeter", ctypes.c_long),
+        ("biClrUsed", DWORD),
+        ("biClrImportant", DWORD),
+    ]
+
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [
+        ("bmiHeader", BITMAPINFOHEADER),
+        ("bmiColors", DWORD * 3),
+    ]
+
 # ---------- 常量 ----------
 WS_POPUP = 0x80000000
 WS_CHILD = 0x40000000
@@ -86,6 +109,11 @@ WS_VISIBLE = 0x10000000
 BS_LEFT = 0x100
 SS_LEFT = 0x0
 SS_CENTER = 0x1
+SS_BITMAP = 0x000E
+SS_NOTIFY = 0x0100
+SS_CENTERIMAGE = 0x0200
+STM_SETIMAGE = 0x0172
+IMAGE_BITMAP = 0
 WS_EX_TOPMOST = 0x8
 WS_EX_TOOLWINDOW = 0x80
 
@@ -142,6 +170,12 @@ kernel32.GlobalSize.restype = ctypes.c_size_t
 shell32.DragQueryFileW.argtypes = [HANDLE, UINT, LPCWSTR, UINT]
 gdi32.CreateFontW.restype = HFONT
 gdi32.CreateSolidBrush.restype = HBRUSH
+gdi32.CreateDIBSection.argtypes = [HANDLE, LPVOID, UINT, ctypes.POINTER(LPVOID), HANDLE, DWORD]
+gdi32.CreateDIBSection.restype = HANDLE
+gdi32.CreateCompatibleDC.argtypes = [HANDLE]
+gdi32.CreateCompatibleDC.restype = HANDLE
+gdi32.DeleteDC.argtypes = [HANDLE]
+gdi32.DeleteObject.argtypes = [HANDLE]
 user32.SetWindowsHookExW.argtypes = [INT, HOOKPROC, HINSTANCE, DWORD]
 user32.SetWindowsHookExW.restype = HANDLE
 user32.UnhookWindowsHookEx.argtypes = [HANDLE]
@@ -201,6 +235,7 @@ ID_CLEAR = 5000
 ID_CLOSE = 5001
 ID_QUIT = 5002
 ID_AUTOSTART = 5003  # 开机自启开关
+ID_THUMB0 = 7000     # 图片缩略图点击（粘贴）
 
 WIN_W = 430
 ROW_H = 40
@@ -334,6 +369,37 @@ def set_clipboard(item):
     return True
 
 
+def pil_to_hbitmap(img):
+    """PIL Image -> HBITMAP（32bpp，自上而下），供 STATIC 缩略图显示。
+    透明像素先合成到白底，避免 GDI 忽略 alpha 后变黑。"""
+    try:
+        img = img.convert("RGBA")
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        bg.alpha_composite(img)
+        img = bg.convert("RGB").convert("RGBA")
+        w, h = img.size
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = w
+        bmi.bmiHeader.biHeight = -h  # 负值 = 自上而下
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0  # BI_RGB
+        pv = LPVOID()
+        hdc = gdi32.CreateCompatibleDC(None)
+        hbmp = gdi32.CreateDIBSection(hdc, ctypes.byref(bmi), 0,
+                                      ctypes.byref(pv), None, 0)
+        if hbmp and pv:
+            raw = img.tobytes("raw", "BGRA")
+            ctypes.memmove(pv, raw, len(raw))
+        if hdc:
+            gdi32.DeleteDC(hdc)
+        return hbmp
+    except Exception as e:
+        print("[thumbnail]", e, flush=True)
+        return None
+
+
 def send_ctrl_v():
     user32.keybd_event(VK_CONTROL, 0, 0, 0)
     user32.keybd_event(VK_V, 0, 0, 0)
@@ -457,6 +523,7 @@ class ClipStackApp:
         self._hook = None
         self._hook_proc = None
         self.feature_on = True  # 双击 Ctrl 控制的总开关
+        self._hbitmaps = []     # 缩略图位图句柄，重建时释放
 
     # ---- 双击 Ctrl 判定（钩子线程调用） ----
     def on_key_event(self, wp, vk):
@@ -613,6 +680,10 @@ class ClipStackApp:
             if h:
                 user32.DestroyWindow(h)
         self.children = []
+        for hb in self._hbitmaps:
+            if hb:
+                gdi32.DeleteObject(hb)
+        self._hbitmaps = []
 
     def visible_items(self):
         with self.lock:
@@ -653,8 +724,22 @@ class ClipStackApp:
             gi = base + i
             self._visible_gis.append(gi)
             tag = str(i + 1) if i < 9 else " "
-            self._ctrl("BUTTON", tag + self._item_label(item), BS_LEFT,
-                       6, y, WIN_W - 66, ROW_H, ID_PASTE0 + gi)
+            hbmp = None
+            if item["type"] == "image":
+                thumb = item["data"].copy()
+                thumb.thumbnail((56, ROW_H - 6))
+                hbmp = pil_to_hbitmap(thumb)
+            if hbmp:
+                self._hbitmaps.append(hbmp)
+                st = self._ctrl("STATIC", "", SS_BITMAP | SS_CENTERIMAGE | SS_NOTIFY,
+                                8, y, 58, ROW_H, ID_THUMB0 + gi)
+                user32.SendMessageW(st, STM_SETIMAGE, IMAGE_BITMAP,
+                                    ctypes.cast(hbmp, ctypes.c_void_p).value)
+                self._ctrl("BUTTON", tag + self._item_label(item), BS_LEFT,
+                           70, y, WIN_W - 130, ROW_H, ID_PASTE0 + gi)
+            else:
+                self._ctrl("BUTTON", tag + self._item_label(item), BS_LEFT,
+                           6, y, WIN_W - 66, ROW_H, ID_PASTE0 + gi)
             self._ctrl("BUTTON", "×", SS_CENTER,
                        WIN_W - 56, y, 30, ROW_H, ID_DEL0 + gi)
             y += ROW_H + ROW_GAP
@@ -711,6 +796,8 @@ class ClipStackApp:
             n = len(self.history)
         if ID_PASTE0 <= cid < ID_PASTE0 + n:
             self.paste_item(cid - ID_PASTE0)
+        elif ID_THUMB0 <= cid < ID_THUMB0 + n:
+            self.paste_item(cid - ID_THUMB0)  # 点击图片缩略图也粘贴
         elif ID_DEL0 <= cid < ID_DEL0 + n:
             self.delete_item(cid - ID_DEL0)
         elif cid == ID_CLEAR:
